@@ -27,6 +27,31 @@ function getBatchId() {
   return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 }
 
+async function processJob(rawText) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const response = await fetch(
+      NLP_API_URL,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_description: rawText }),
+        signal: controller.signal,
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    return await response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 /* ===============================
    Worker
 ================================ */
@@ -45,64 +70,26 @@ async function startWorker() {
 
     try {
       const payload = JSON.parse(msg.content.toString());
-
       const rawText = payload.job;
-      const jobId = payload.jobId || crypto.randomUUID();
 
-      console.log(`⚙️ Processando vaga ${jobId}`);
+      const result = await processJob(rawText);
 
-      /* ===============================
-         Chamada API NLP
-      ================================ */
-
-      const response = await fetch(NLP_API_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          job_description: rawText,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(
-          `Erro NLP API: ${response.status} ${response.statusText}`
-        );
-      }
-
-      const nlpResult = await response.json();
-
-      console.log(`🧠 NLP concluído para ${jobId}`);
-
-      /* ===============================
-         Persistência em cache
-      ================================ */
-
+      // salva no cache
       const cache = loadCache();
-
       cache.push({
-        id: jobId,
+        id: payload.jobId,
         batchId: getBatchId(),
         createdAt: new Date().toISOString(),
+        result,
         status: "ready",
-        originalText: rawText,
-        extracted: nlpResult.extracted_data ?? nlpResult,
       });
-
       saveCache(cache);
 
-      /* ===============================
-         ACK FINAL
-      ================================ */
-
-      channel.ack(msg);
-      console.log(`✅ Vaga ${jobId} salva e confirmada`);
+      channel.ack(msg); // 👈 SOMENTE AQUI
+      console.log("✅ Processado com sucesso");
     } catch (err) {
-      console.error("❌ Erro no processamento:", err.message);
-
-      // descarta a mensagem (não reprocessa)
-      channel.nack(msg, false, false);
+      console.error("❌ Erro:", err.message);
+      channel.nack(msg, false, false); // descarta ou manda pra DLQ
     }
   });
 }
