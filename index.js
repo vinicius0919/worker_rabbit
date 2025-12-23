@@ -1,52 +1,35 @@
 const amqp = require("amqplib");
-const fs = require("fs");
-const path = require("path");
 const crypto = require("crypto");
 require("dotenv").config();
 
-const RABBIT_URL = process.env.RABBIT_URL;
-const QUEUE = process.env.QUEUE_JOBS || "jobs";
-const NLP_API_URL = process.env.NLP_API_URL;
-
-const CACHE_FILE = path.resolve("cache.json");
+const {
+  RABBIT_URL,
+  QUEUE_JOBS = "jobs",
+  QUEUE_RESULTS = "job_results",
+  NLP_API_URL,
+} = process.env;
 
 /* ===============================
-   Cache helpers
+   NLP processing
 ================================ */
-
-function loadCache() {
-  if (!fs.existsSync(CACHE_FILE)) return [];
-  return JSON.parse(fs.readFileSync(CACHE_FILE, "utf-8"));
-}
-
-function saveCache(data) {
-  fs.writeFileSync(CACHE_FILE, JSON.stringify(data, null, 2));
-}
-
-function getBatchId() {
-  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-}
 
 async function processJob(rawText) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30000);
 
   try {
-    const response = await fetch(
-      NLP_API_URL,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ job_description: rawText }),
-        signal: controller.signal,
-      }
-    );
+    const res = await fetch(NLP_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_description: rawText }),
+      signal: controller.signal,
+    });
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+    if (!res.ok) {
+      throw new Error(`NLP API HTTP ${res.status}`);
     }
 
-    return await response.json();
+    return await res.json();
   } finally {
     clearTimeout(timeout);
   }
@@ -60,40 +43,46 @@ async function startWorker() {
   const conn = await amqp.connect(RABBIT_URL);
   const channel = await conn.createChannel();
 
-  await channel.assertQueue(QUEUE, { durable: true });
+  await channel.assertQueue(QUEUE_JOBS, { durable: true });
+  await channel.assertQueue(QUEUE_RESULTS, { durable: true });
+
   channel.prefetch(1);
 
-  console.log("🟢 Worker aguardando vagas...");
+  console.log("🟢 Worker NLP aguardando vagas...");
 
-  channel.consume(QUEUE, async (msg) => {
+  channel.consume(QUEUE_JOBS, async (msg) => {
     if (!msg) return;
 
     try {
       const payload = JSON.parse(msg.content.toString());
+
+      const jobId = payload.jobId || crypto.randomUUID();
       const rawText = payload.job;
 
-      const result = await processJob(rawText);
+      console.log(`⚙️ Processando vaga ${jobId}`);
 
-      // salva no cache
-      const cache = loadCache();
-      cache.push({
-        id: payload.jobId,
-        batchId: getBatchId(),
-        createdAt: new Date().toISOString(),
-        result,
-        status: "ready",
-      });
-      saveCache(cache);
+      const nlpResult = await processJob(rawText);
 
-      channel.ack(msg); // 👈 SOMENTE AQUI
-      console.log("✅ Processado com sucesso");
+      const resultPayload = {
+        id: jobId,
+        processedAt: new Date().toISOString(),
+        originalText: rawText,
+        extracted: nlpResult.extracted_data ?? nlpResult,
+      };
+
+      channel.sendToQueue(
+        QUEUE_RESULTS,
+        Buffer.from(JSON.stringify(resultPayload)),
+        { persistent: true }
+      );
+
+      channel.ack(msg);
+      console.log(`✅ Vaga ${jobId} enviada para job_results`);
     } catch (err) {
-      console.error("❌ Erro:", err.message);
-      channel.nack(msg, false, false); // descarta ou manda pra DLQ
+      console.error("❌ Erro NLP:", err.message);
+      channel.nack(msg, false, false); // descarta ou DLQ
     }
   });
 }
 
-startWorker().catch((err) => {
-  console.error("❌ Falha ao iniciar worker:", err);
-});
+startWorker().catch(console.error);
