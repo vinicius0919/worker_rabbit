@@ -15,7 +15,7 @@ const {
 
 async function processJob(rawText) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60*1000);
+  const timeout = setTimeout(() => controller.abort(), 60 * 1000);
 
   try {
     const res = await fetch(NLP_API_URL, {
@@ -57,12 +57,15 @@ async function startWorker() {
       const payload = JSON.parse(msg.content.toString());
 
       const jobId = payload.jobId || crypto.randomUUID();
-      const rawText = payload.job;
+      const rawText = payload.body;
+      const url = payload.link;
 
       console.log(`⚙️ Processando vaga ${jobId}`);
+      console.log(payload);
 
       const nlpResult = await processJob(rawText);
-
+      nlpResult.extracted_data.job_link = url
+      console.log(nlpResult);
       const resultPayload = {
         id: jobId,
         processedAt: new Date().toISOString(),
